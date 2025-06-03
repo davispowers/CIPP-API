@@ -1,0 +1,185 @@
+name: Auto Sync with Upstream
+
+on:
+  schedule:
+    # Run every day at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      sync_branch:
+        description: 'Branch to sync'
+        required: false
+        default: 'master'
+        type: choice
+        options:
+          - master
+          - dev
+
+env:
+  UPSTREAM_REPO: KelvinTegelaar/CIPP-API
+  UPSTREAM_BRANCH: master
+  TARGET_BRANCH: master
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          git fetch upstream
+
+      - name: Check for updates
+        id: check_updates
+        run: |
+          LOCAL_COMMIT=$(git rev-parse HEAD)
+          UPSTREAM_COMMIT=$(git rev-parse upstream/${{ env.UPSTREAM_BRANCH }})
+          
+          if [ "$LOCAL_COMMIT" = "$UPSTREAM_COMMIT" ]; then
+            echo "No updates available"
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+          else
+            echo "Updates available"
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create sync branch
+        if: steps.check_updates.outputs.has_updates == 'true'
+        run: |
+          SYNC_BRANCH="auto-sync-$(date +%Y%m%d-%H%M%S)"
+          echo "SYNC_BRANCH=$SYNC_BRANCH" >> $GITHUB_ENV
+          git checkout -b $SYNC_BRANCH
+
+      - name: Attempt rebase
+        if: steps.check_updates.outputs.has_updates == 'true'
+        id: rebase
+        continue-on-error: true
+        run: |
+          # Try to rebase onto upstream
+          if git rebase upstream/${{ env.UPSTREAM_BRANCH }}; then
+            echo "Rebase successful"
+            echo "rebase_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "Rebase failed, attempting merge"
+            git rebase --abort
+            echo "rebase_success=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Attempt merge
+        if: steps.check_updates.outputs.has_updates == 'true' && steps.rebase.outputs.rebase_success == 'false'
+        id: merge
+        continue-on-error: true
+        run: |
+          # Reset to original state
+          git reset --hard origin/${{ env.TARGET_BRANCH }}
+          
+          # Try merge with strategy options
+          if git merge upstream/${{ env.UPSTREAM_BRANCH }} --no-edit -X theirs; then
+            echo "Merge successful with conflict resolution"
+            echo "merge_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "Merge has conflicts that need manual resolution"
+            echo "merge_success=false" >> $GITHUB_OUTPUT
+            
+            # Save conflict information
+            git diff --name-only --diff-filter=U > conflicts.txt
+            echo "conflicts<<EOF" >> $GITHUB_OUTPUT
+            cat conflicts.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Push changes directly (if no conflicts)
+        if: |
+          steps.check_updates.outputs.has_updates == 'true' && 
+          (steps.rebase.outputs.rebase_success == 'true' || steps.merge.outputs.merge_success == 'true')
+        run: |
+          git push origin HEAD:${{ env.TARGET_BRANCH }}
+
+      - name: Create Pull Request (if conflicts)
+        if: |
+          steps.check_updates.outputs.has_updates == 'true' && 
+          steps.rebase.outputs.rebase_success == 'false' && 
+          steps.merge.outputs.merge_success == 'false'
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "Auto-sync with upstream (conflicts need resolution)"
+          title: "🔄 Auto-sync from upstream - Manual conflict resolution required"
+          body: |
+            ## Automatic sync from upstream repository
+            
+            This PR was created automatically because there are merge conflicts that need manual resolution.
+            
+            **Upstream repository:** ${{ env.UPSTREAM_REPO }}
+            **Upstream branch:** ${{ env.UPSTREAM_BRANCH }}
+            
+            ### Conflicts detected in:
+            ```
+            ${{ steps.merge.outputs.conflicts }}
+            ```
+            
+            ### Resolution steps:
+            1. Check out this branch locally
+            2. Resolve the conflicts manually
+            3. Test the application
+            4. Merge this PR
+            
+            ### Commands to resolve locally:
+            ```bash
+            git fetch origin
+            git checkout ${{ env.SYNC_BRANCH }}
+            git merge upstream/${{ env.UPSTREAM_BRANCH }}
+            # Resolve conflicts
+            git add .
+            git commit
+            git push
+            ```
+          branch: ${{ env.SYNC_BRANCH }}
+          labels: |
+            auto-sync
+            conflicts
+            needs-review
+
+      - name: Notify success
+        if: |
+          steps.check_updates.outputs.has_updates == 'true' && 
+          (steps.rebase.outputs.rebase_success == 'true' || steps.merge.outputs.merge_success == 'true')
+        run: |
+          echo "✅ Successfully synced with upstream repository"
+          echo "Strategy used: ${{ steps.rebase.outputs.rebase_success == 'true' && 'rebase' || 'merge' }}"
+
+      - name: Create issue for conflicts
+        if: |
+          steps.check_updates.outputs.has_updates == 'true' && 
+          steps.rebase.outputs.rebase_success == 'false' && 
+          steps.merge.outputs.merge_success == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🚨 Upstream sync conflicts detected',
+              body: `Automatic sync with upstream repository failed due to merge conflicts.
+              
+              **Conflicts in files:**
+              \`\`\`
+              ${{ steps.merge.outputs.conflicts }}
+              \`\`\`
+              
+              A pull request has been created for manual resolution: #${{ env.SYNC_BRANCH }}
+              
+              Please resolve the conflicts as soon as possible to keep the fork up to date.`,
+              labels: ['upstream-sync', 'conflicts', 'urgent']
+            });
